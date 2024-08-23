@@ -1,0 +1,152 @@
+# Author: Mengfei Wang from Dalian Medical University, China.
+# The script is based on Peter's. (Peter is the author of Qupath. Thanko to Peter and his team for their excellent job.)
+# Date: 2024.08.23
+# Aim: Automatically divide the TLS in tumor microenvironment(TME) as Intratumoral-TLS, InnerMargin-TLS(inner 500um of the tumor margin), OuterMargin-TLS(Outer 500um of the tumor margin) and Stromal-TLS.
+# All the steps are based on Qupath software.
+# Setp1 : Manually circle all the TLS in the TME, and set the classification as TLS (is not in default classification, you should add it in the classification list at first).
+# Setp2 : Manually circle the tumor region, set the classification as Tumor, and  circle the total tissue, set the classification as tissue (add these two classification in the list at first).
+# Step3 : Copy the script to the "script editor" (in Automate). Then choose run for one image, choose run for project for all images in the project.
+import org.locationtech.jts.geom.Geometry
+import qupath.lib.common.GeneralTools
+import qupath.lib.objects.PathObject
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.GeometryTools
+import qupath.lib.roi.ROIs
+import qupath.lib.objects.classes.PathClass
+
+import static qupath.lib.gui.scripting.QPEx.*
+
+//-----
+// Some things you might want to change
+
+// How much to expand each region
+double expandMarginMicrons = 500.0
+
+// Define the colors and classes
+def coloInnerMargin = getColorRGB(0, 0, 200)
+def colorOuterMargin = getColorRGB(0, 200, 0)
+def colorCentral = getColorRGB(0, 0, 0)
+def colorStroma = getColorRGB(200, 0, 0)
+
+def classTLS_Center = PathClass.fromString("TLS_Center", getColorRGB(255, 0, 0))
+def classTLS_InnerMargin = PathClass.fromString("TLS_InnerMargin", getColorRGB(0, 255, 0))
+def classTLS_Stroma = PathClass.fromString("TLS_Stroma", getColorRGB(0, 0, 255))
+def classTLS_OuterMargin = PathClass.fromString("TLS_OuterMargin", getColorRGB(255, 255, 0))
+
+// Choose whether to lock the annotations or not (it's generally a good idea to avoid accidentally moving them)
+def lockAnnotations = true
+
+//-----
+
+// Extract the main info we need
+def imageData = getCurrentImageData()
+def hierarchy = imageData.getHierarchy()
+def server = imageData.getServer()
+
+// We need the pixel size
+def cal = server.getPixelCalibration()
+if (!cal.hasPixelSizeMicrons()) {
+  print 'We need the pixel size information here!'
+  return
+}
+if (!GeneralTools.almostTheSame(cal.getPixelWidthMicrons(), cal.getPixelHeightMicrons(), 0.0001)) {
+  print 'Warning! The pixel width & height are different; the average of both will be used'
+}
+
+// Get annotations
+def annotations = getAnnotationObjects()
+if (annotations.size() < 2) {
+  print 'Please ensure at least two annotations are present: one for the Tumor and one for the Tissue!'
+  return
+}
+
+// Assign the tumor and tissue annotations
+def tumorAnnotation = annotations.find { it.getPathClass() != null && it.getPathClass().getName().equalsIgnoreCase("Tumor") }
+def tissueAnnotation = annotations.find { it.getPathClass() != null && it.getPathClass().getName().equalsIgnoreCase("Tissue") }
+
+if (tumorAnnotation == null) {
+  print 'Tumor annotation not found. Please ensure there is a correctly classified "Tumor" annotation.'
+  return
+}
+if (tissueAnnotation == null) {
+  print 'Tissue annotation not found. Please ensure there is a correctly classified "Tissue" annotation.'
+  return
+}
+
+// Extract the ROI & plane
+def roiTumor = tumorAnnotation.getROI()
+def plane = roiTumor.getImagePlane()
+def areaTissue = tissueAnnotation.getROI().getGeometry()
+
+// Calculate how much to expand
+double expandPixels = expandMarginMicrons / cal.getAveragedPixelSizeMicrons()
+def areaTumor = roiTumor.getGeometry()
+
+// Get the outer margin area
+def geomOuter = areaTumor.buffer(expandPixels)
+geomOuter = geomOuter.difference(areaTumor)
+def roiOuter = GeometryTools.geometryToROI(geomOuter.intersection(areaTissue), plane)
+def annotationOuter = PathObjects.createAnnotationObject(roiOuter)
+annotationOuter.setName("Outer margin")
+annotationOuter.setColorRGB(colorOuterMargin)
+
+// Get the central area
+def geomCentral = areaTumor.buffer(-expandPixels)
+def roiCentral = GeometryTools.geometryToROI(geomCentral.intersection(areaTissue), plane)
+def annotationCentral = PathObjects.createAnnotationObject(roiCentral)
+annotationCentral.setName("Center")
+annotationCentral.setColorRGB(colorCentral)
+
+// Get the inner margin area
+def geomInner = areaTumor.difference(geomCentral)
+def roiInner = GeometryTools.geometryToROI(geomInner.intersection(areaTissue), plane)
+def annotationInner = PathObjects.createAnnotationObject(roiInner)
+annotationInner.setName("Inner margin")
+annotationInner.setColorRGB(coloInnerMargin)
+
+// Calculate the stroma area by removing the central, outer, and inner margin areas from the tissue
+def geomStroma = areaTissue
+geomStroma = geomStroma.difference(geomCentral)  // Remove central area
+geomStroma = geomStroma.difference(geomOuter)    // Remove outer margin area
+geomStroma = geomStroma.difference(geomInner)    // Remove inner margin area
+
+def roiStroma = GeometryTools.geometryToROI(geomStroma, plane)
+def annotationStroma = PathObjects.createAnnotationObject(roiStroma)
+annotationStroma.setName("Stroma")
+annotationStroma.setColorRGB(colorStroma)
+
+// Add the annotations
+hierarchy.getSelectionModel().clearSelection()
+hierarchy.removeObject(tumorAnnotation, true)
+hierarchy.removeObject(tissueAnnotation, true)  // Delete the tissue annotation
+
+def annotationsToAdd = [annotationOuter, annotationInner, annotationCentral, annotationStroma];
+annotationsToAdd.each {it.setLocked(lockAnnotations)}
+hierarchy.addPathObjects(annotationsToAdd)
+
+// Now, classify the TLS annotations based on overlapping areas
+def tlsAnnotations = annotations.findAll { it.getPathClass() != null && it.getPathClass().getName().equalsIgnoreCase("TLS") }
+tlsAnnotations.each { tls ->
+    def geomTLS = tls.getROI().getGeometry()
+    def overlapCenter = geomTLS.intersection(geomCentral).getArea()
+    def overlapInner = geomTLS.intersection(geomInner).getArea()
+    def overlapStroma = geomTLS.intersection(geomStroma).getArea()
+    def overlapOuter = geomTLS.intersection(geomOuter).getArea()
+    
+    def maxOverlap = Math.max(overlapCenter, Math.max(overlapInner, Math.max(overlapStroma, overlapOuter)))
+    
+    if (maxOverlap == overlapCenter) {
+        tls.setPathClass(classTLS_Center)
+    } else if (maxOverlap == overlapInner) {
+        tls.setPathClass(classTLS_InnerMargin)
+    } else if (maxOverlap == overlapStroma) {
+        tls.setPathClass(classTLS_Stroma)
+    } else if (maxOverlap == overlapOuter) {
+        tls.setPathClass(classTLS_OuterMargin)
+    }
+}
+
+// Update the hierarchy after classification
+hierarchy.fireHierarchyChangedEvent(this, null)
+
+print "TLS annotations have been successfully classified based on the largest overlapping area."
